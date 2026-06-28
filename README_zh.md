@@ -1,5 +1,7 @@
 # Magisk NetBird
 
+[English](README.md)
+
 Magisk NetBird 用于在已 root 的 Android 设备上以开机服务方式运行 Linux 版 NetBird 客户端。当前版本让 NetBird 自己创建和维护 WireGuard 接口，不再额外使用 SOCKS 桥接层。
 
 ## Quickstart

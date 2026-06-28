@@ -1,5 +1,7 @@
 # Magisk NetBird
 
+[中文](README_zh.md)
+
 Magisk NetBird runs the Linux NetBird client on rooted Android as a boot service. NetBird now uses its own NetBird-managed WireGuard interface, so the module no longer adds a separate SOCKS bridge or secondary transparent-routing daemon.
 
 ## How It Works
