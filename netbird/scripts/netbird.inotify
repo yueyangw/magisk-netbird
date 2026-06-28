@@ -1,0 +1,17 @@
+#!/system/bin/sh
+
+DIR="$(dirname "$(realpath "$0")")"
+. "$DIR/../settings.sh"
+
+events="$1"
+monitor_file="$3"
+
+if [ "$monitor_file" = "disable" ]; then
+  if [ "$events" = "d" ]; then
+    log Info "Module enabled; starting NetBird"
+    netbird.service start >>"$NB_RUN_LOG_FILE" 2>&1
+  elif [ "$events" = "n" ]; then
+    log Info "Module disabled; stopping NetBird"
+    netbird.service stop >>"$NB_RUN_LOG_FILE" 2>&1
+  fi
+fi

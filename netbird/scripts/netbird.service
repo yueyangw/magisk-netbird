@@ -1,0 +1,611 @@
+#!/system/bin/sh
+# @title NetBird Service Manager
+# @cmd start | Start NetBird daemon
+# @cmd stop | Stop NetBird daemon
+# @cmd restart | Restart NetBird daemon
+# @cmd status | Show daemon status
+# @cmd log | Show logs: daemon or service
+# @cmd help | Show usage
+
+DIR="$(dirname "$(realpath "$0")")"
+. "$DIR/../settings.sh"
+
+SCRIPT_NAME="$(basename "$0")"
+DAEMON_PATTERN="netbird service run"
+PID_FILE="${NB_RUN_DIR}/netbird.pid"
+NB_POLICY_RULE_PRIORITY="${NB_POLICY_RULE_PRIORITY:-9000}"
+NB_POLICY_ROUTE_TABLE="${NB_POLICY_ROUTE_TABLE:-10090}"
+NB_ROOT_BYPASS_RULE_PRIORITY="${NB_ROOT_BYPASS_RULE_PRIORITY:-9010}"
+NB_ANDROID_VPN_PROTECT_MARK="${NB_ANDROID_VPN_PROTECT_MARK:-0x20000}"
+NB_DNS_UPSTREAMS_FILE="${NB_RUN_DIR}/dns.upstreams"
+NB_DNS_REDIRECT_TARGET_FILE="${NB_RUN_DIR}/dns.redirect.target"
+
+usage() {
+  echo "usage: ${SCRIPT_NAME} {start|stop|restart|status|log|help}"
+  echo "       ${SCRIPT_NAME} log {daemon|service}"
+}
+
+is_running() {
+  pidof_command "$DAEMON_PATTERN" >/dev/null 2>&1
+}
+
+daemon_pid() {
+  pidof_command "$DAEMON_PATTERN" | tr '\n' ' '
+}
+
+su_supports_group() {
+  command -v su >/dev/null 2>&1 || return 1
+  su --help 2>&1 | grep -q -- '--group'
+}
+
+android_underlying_route_table() {
+  ip rule show 2>/dev/null |
+    awk '
+      /fwmark 0x0\/0xffff/ && /iif lo/ && /lookup/ {
+        print $NF
+        exit
+      }
+    '
+}
+
+cleanup_android_vpn_bypass_rules() {
+  while ip rule del priority "$NB_ROOT_BYPASS_RULE_PRIORITY" >/dev/null 2>&1; do
+    :
+  done
+  while ip -6 rule del priority "$NB_ROOT_BYPASS_RULE_PRIORITY" >/dev/null 2>&1; do
+    :
+  done
+
+  [ -n "$NB_DAEMON_GID" ] || return 0
+  for table in iptables ip6tables; do
+    command -v "$table" >/dev/null 2>&1 || continue
+    while "$table" -w 5 -t mangle -D OUTPUT -m owner --gid-owner "$NB_DAEMON_GID" -j MARK --set-xmark "${NB_ANDROID_VPN_PROTECT_MARK}/${NB_ANDROID_VPN_PROTECT_MARK}" >/dev/null 2>&1; do
+      :
+    done
+  done
+}
+
+sync_android_vpn_bypass_rules() {
+  underlying_table="$(android_underlying_route_table 2>/dev/null || true)"
+  cleanup_android_vpn_bypass_rules
+
+  if [ -n "$underlying_table" ]; then
+    ip rule add priority "$NB_ROOT_BYPASS_RULE_PRIORITY" uidrange 0-0 lookup "$underlying_table" >/dev/null 2>&1 || true
+    ip -6 rule add priority "$NB_ROOT_BYPASS_RULE_PRIORITY" uidrange 0-0 lookup "$underlying_table" >/dev/null 2>&1 || true
+  fi
+
+  [ -n "$NB_DAEMON_GID" ] && su_supports_group || {
+    ip route flush cache >/dev/null 2>&1 || true
+    return 0
+  }
+
+  for table in iptables ip6tables; do
+    command -v "$table" >/dev/null 2>&1 || continue
+    "$table" -w 5 -t mangle -A OUTPUT -m owner --gid-owner "$NB_DAEMON_GID" -j MARK --set-xmark "${NB_ANDROID_VPN_PROTECT_MARK}/${NB_ANDROID_VPN_PROTECT_MARK}" >/dev/null 2>&1 || true
+  done
+  ip route flush cache >/dev/null 2>&1 || true
+}
+
+daemon_command_line() {
+  printf '%s\n' "PATH=${PATH} HOME=${HOME} USER=root LOGNAME=root USERNAME=root SHELL=${SHELL} SSL_CERT_DIR=${SSL_CERT_DIR} NB_STATE_DIR=${NB_STATE_DIR} NB_DAEMON_ADDR=${NB_DAEMON_ADDR} NB_LOG_FILE=${NB_LOG_FILE} NB_USE_LEGACY_ROUTING=${NB_USE_LEGACY_ROUTING} NB_DNS_RESOLVER_ADDRESS=${NB_DNS_RESOLVER_ADDRESS} ${NB_DAEMON_CMD}"
+}
+
+start_netbird_process() {
+  cmdline="$(daemon_command_line)"
+  if [ -n "$NB_DAEMON_GID" ] && su_supports_group; then
+    nohup su -g "$NB_DAEMON_GID" 0 -c "$cmdline" </dev/null >"$NB_LOG_FILE" 2>&1 &
+  else
+    nohup sh -c "$cmdline" </dev/null >"$NB_LOG_FILE" 2>&1 &
+  fi
+}
+
+wait_ready() {
+  i=0
+  while [ "$i" -lt 30 ]; do
+    if netbird status --check live >/dev/null 2>&1; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  return 1
+}
+
+wg_iface_name() {
+  if [ -s "$NB_CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+    iface="$(jq -r '.WgIface // "wt0"' "$NB_CONFIG_FILE" 2>/dev/null || true)"
+    [ -n "$iface" ] && [ "$iface" != "null" ] && {
+      printf '%s\n' "$iface"
+      return 0
+    }
+  fi
+  printf '%s\n' "wt0"
+}
+
+ensure_native_config() {
+  [ -s "$NB_CONFIG_FILE" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  tmp="${NB_CONFIG_FILE}.tmp.$$"
+  if dns_resolver_address_is_custom; then
+    filter='.DisableIPv6 = true | .DisableIPv6Discovery = true | .DisableDNS = false | .CustomDNSAddress = $dns'
+  else
+    filter='.DisableIPv6 = true | .DisableIPv6Discovery = true | .DisableDNS = false | del(.CustomDNSAddress)'
+  fi
+  if jq --arg dns "$NB_DNS_RESOLVER_ADDRESS" "$filter" "$NB_CONFIG_FILE" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$NB_CONFIG_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+netbird_wg_ipv4() {
+  iface="$(wg_iface_name)"
+  ip -4 addr show dev "$iface" 2>/dev/null | awk '
+    $1 == "inet" {
+      split($2, a, "/")
+      if (a[1] != "") {
+        print a[1]
+        exit
+      }
+    }
+  '
+}
+
+effective_dns_resolver_address() {
+  if dns_resolver_address_is_custom; then
+    printf '%s\n' "$NB_DNS_RESOLVER_ADDRESS"
+    return 0
+  fi
+  dns_ip="$(netbird_wg_ipv4)"
+  [ -n "$dns_ip" ] || return 1
+  printf '%s:53\n' "$dns_ip"
+}
+
+dns_resolver_ip() {
+  dns_address="$(effective_dns_resolver_address)" || return 1
+  printf '%s\n' "${dns_address%:*}"
+}
+
+dns_resolver_port() {
+  dns_address="$(effective_dns_resolver_address)" || return 1
+  printf '%s\n' "${dns_address##*:}"
+}
+
+netbird_dns_is_listening() {
+  command -v ss >/dev/null 2>&1 || return 0
+  dns_ip="$(dns_resolver_ip)" || return 1
+  dns_port="$(dns_resolver_port)" || return 1
+  ss -ulpn 2>/dev/null | grep -q "${dns_ip}:${dns_port}.*netbird" && return 0
+  ss -tlpn 2>/dev/null | grep -q "${dns_ip}:${dns_port}.*netbird" && return 0
+  return 1
+}
+
+prepare_android_resolvconf_manager() {
+  [ -n "$NB_RESOLV_CONF" ] || return 0
+  [ -f "$NB_RESOLV_CONF" ] || return 0
+
+  mkdir -p "$NB_RUN_DIR"
+  if ! grep -q "^# Generated by Magisk NetBird" "$NB_RESOLV_CONF" 2>/dev/null &&
+    ! grep -q "resolvconf managed by Magisk NetBird" "$NB_RESOLV_CONF" 2>/dev/null &&
+    [ ! -s "$NB_RESOLV_CONF_BACKUP" ]; then
+    cp "$NB_RESOLV_CONF" "$NB_RESOLV_CONF_BACKUP" >/dev/null 2>&1 || true
+  fi
+
+  original="$NB_RESOLV_CONF_BACKUP"
+  [ -s "$original" ] || original="$NB_RESOLV_CONF"
+  tmp="${NB_RUN_DIR}/resolvconf-managed.$$"
+
+  {
+    echo "# resolvconf managed by Magisk NetBird"
+    awk '
+      /^nameserver[ \t]+/ && $2 !~ /^127\./ && $2 != "::1" { print; has_ns = 1; next }
+      /^search[ \t]+/ { print; next }
+      /^domain[ \t]+/ { print; next }
+      /^options[ \t]+/ { print; has_options = 1; next }
+      END {
+        if (!has_ns) {
+          print "nameserver 119.29.29.29"
+          print "nameserver 223.5.5.5"
+          print "nameserver 1.1.1.1"
+          print "nameserver 8.8.8.8"
+        }
+        if (!has_options) print "options timeout:2 attempts:2"
+      }
+    ' "$original" 2>/dev/null
+  } >"$tmp" || {
+    rm -f "$tmp"
+    return 0
+  }
+
+  if [ -n "$NB_RESOLV_CONF_MODULE" ]; then
+    mkdir -p "$(dirname "$NB_RESOLV_CONF_MODULE")" >/dev/null 2>&1 || true
+    cp "$tmp" "$NB_RESOLV_CONF_MODULE" >/dev/null 2>&1 || true
+  fi
+
+  cp "$tmp" "$NB_RESOLV_CONF" >/dev/null 2>&1 || true
+  if ! grep -q "resolvconf managed by Magisk NetBird" "$NB_RESOLV_CONF" 2>/dev/null && [ -s "$NB_RESOLV_CONF_MODULE" ]; then
+    mount -o bind "$NB_RESOLV_CONF_MODULE" "$NB_RESOLV_CONF" >/dev/null 2>&1 || true
+  fi
+  rm -f "$tmp"
+}
+
+sync_android_resolv_conf() {
+  [ -n "$NB_RESOLV_CONF" ] || return 0
+  [ -f "$NB_RESOLV_CONF" ] || return 0
+  netbird_dns_is_listening || return 0
+
+  mkdir -p "$NB_RUN_DIR"
+  if ! grep -q "^# Generated by Magisk NetBird" "$NB_RESOLV_CONF" 2>/dev/null; then
+    cp "$NB_RESOLV_CONF" "$NB_RESOLV_CONF_BACKUP" >/dev/null 2>&1 || true
+  fi
+
+  original="$NB_RESOLV_CONF_BACKUP"
+  [ -s "$original" ] || original="$NB_RESOLV_CONF"
+  dns_address="$(effective_dns_resolver_address)" || return 0
+  dns_ip="${dns_address%:*}"
+  tmp="${NB_RUN_DIR}/resolv.conf.$$"
+
+  {
+    echo "# Generated by Magisk NetBird"
+    echo "# NetBird DNS listens on ${dns_address}."
+    echo "# Original file: ${NB_RESOLV_CONF_BACKUP}"
+    echo "nameserver ${dns_ip}"
+    for conf in "$NB_RUN_DIR"/resolvconf/*.conf; do
+      [ -f "$conf" ] || continue
+      awk '/^(search|domain)[ \t]+/ { print }' "$conf" 2>/dev/null
+    done
+    awk -v ns="$dns_ip" '
+      /^nameserver[ \t]+/ { next }
+      /^search[ \t]+/ { next }
+      /^domain[ \t]+/ { next }
+      /^options[ \t]+/ { print; has_options = 1; next }
+      END { if (!has_options) print "options timeout:2 attempts:2" }
+    ' "$original" 2>/dev/null
+  } >"$tmp" || {
+    rm -f "$tmp"
+    return 0
+  }
+
+  if [ -n "$NB_RESOLV_CONF_MODULE" ]; then
+    mkdir -p "$(dirname "$NB_RESOLV_CONF_MODULE")" >/dev/null 2>&1 || true
+    cp "$tmp" "$NB_RESOLV_CONF_MODULE" >/dev/null 2>&1 || true
+  fi
+
+  cp "$tmp" "$NB_RESOLV_CONF" >/dev/null 2>&1 || true
+  if ! grep -q "^# Generated by Magisk NetBird" "$NB_RESOLV_CONF" 2>/dev/null && [ -s "$NB_RESOLV_CONF_MODULE" ]; then
+    mount -o bind "$NB_RESOLV_CONF_MODULE" "$NB_RESOLV_CONF" >/dev/null 2>&1 || true
+  fi
+  rm -f "$tmp"
+}
+
+restore_android_resolv_conf() {
+  [ -s "$NB_RESOLV_CONF_BACKUP" ] || return 0
+  if [ -n "$NB_RESOLV_CONF_MODULE" ]; then
+    mkdir -p "$(dirname "$NB_RESOLV_CONF_MODULE")" >/dev/null 2>&1 || true
+    cp "$NB_RESOLV_CONF_BACKUP" "$NB_RESOLV_CONF_MODULE" >/dev/null 2>&1 || true
+  fi
+  [ -f "$NB_RESOLV_CONF" ] || return 0
+  grep -q "^# Generated by Magisk NetBird" "$NB_RESOLV_CONF" 2>/dev/null || return 0
+  umount "$NB_RESOLV_CONF" >/dev/null 2>&1 || true
+  cp "$NB_RESOLV_CONF_BACKUP" "$NB_RESOLV_CONF" >/dev/null 2>&1 || true
+}
+
+normalize_dns_upstream_ip() {
+  upstream="$1"
+  upstream="${upstream#dns://}"
+  upstream="${upstream#udp://}"
+  upstream="${upstream#tcp://}"
+  case "$upstream" in
+    \[*\]*)
+      return 1
+      ;;
+    *:*)
+      upstream="${upstream%:*}"
+      ;;
+  esac
+  case "$upstream" in
+    ""|127.*|0.0.0.0|"$(dns_resolver_ip 2>/dev/null || true)") return 1 ;;
+    *[!0-9.]*|*.*.*.*.*) return 1 ;;
+  esac
+  printf '%s\n' "$upstream"
+}
+
+dns_upstreams() {
+  {
+    for file in "$NB_RESOLV_CONF_BACKUP" "$NB_RESOLV_CONF_MODULE"; do
+      [ -s "$file" ] || continue
+      awk '/^nameserver[ \t]+/ { print $2 }' "$file" 2>/dev/null
+    done
+    if command -v jq >/dev/null 2>&1; then
+      netbird status --json 2>/dev/null | jq -r '.dnsServers[]?.servers[]?' 2>/dev/null || true
+    fi
+  } | while IFS= read -r upstream; do
+    normalize_dns_upstream_ip "$upstream" 2>/dev/null || true
+  done | sort -u
+}
+
+cached_dns_upstreams() {
+  {
+    [ -s "$NB_DNS_UPSTREAMS_FILE" ] && cat "$NB_DNS_UPSTREAMS_FILE"
+    dns_upstreams 2>/dev/null || true
+  } | sort -u
+}
+
+cleanup_android_dns_redirect() {
+  upstreams="$(cached_dns_upstreams)"
+  redirect_targets="$(
+    {
+      [ -s "$NB_DNS_REDIRECT_TARGET_FILE" ] && cat "$NB_DNS_REDIRECT_TARGET_FILE"
+      effective_dns_resolver_address 2>/dev/null || true
+      printf '%s\n' "$NB_DNS_RESOLVER_ADDRESS" "127.0.0.1:53"
+    } | awk 'NF' | sort -u
+  )"
+  cleanup_stale_dns_dnat_rules
+  for proto in udp tcp; do
+    for upstream in $upstreams; do
+      if [ -n "$NB_DAEMON_GID" ]; then
+        while iptables -w 5 -t nat -D OUTPUT -p "$proto" -d "$upstream" --dport 53 -m owner --gid-owner "$NB_DAEMON_GID" -j RETURN >/dev/null 2>&1; do
+          :
+        done
+      fi
+      while iptables -w 5 -t nat -D OUTPUT -p "$proto" -d "$upstream" --dport 53 -m owner --uid-owner 0 -j RETURN >/dev/null 2>&1; do
+        :
+      done
+    done
+    for redirect_target in $redirect_targets; do
+      while iptables -w 5 -t nat -D OUTPUT -p "$proto" --dport 53 -m owner ! --uid-owner 0 -j DNAT --to-destination "$redirect_target" >/dev/null 2>&1; do
+        :
+      done
+      while iptables -w 5 -t nat -D OUTPUT -p "$proto" --dport 53 -j DNAT --to-destination "$redirect_target" >/dev/null 2>&1; do
+        :
+      done
+    done
+  done
+}
+
+cleanup_stale_dns_dnat_rules() {
+  iptables -w 5 -t nat -S OUTPUT 2>/dev/null |
+    awk '
+      /--dport 53/ && /-j DNAT/ {
+        sub(/^-A OUTPUT /, "")
+        print
+      }
+    ' |
+    while IFS= read -r rule; do
+      [ -n "$rule" ] || continue
+      while iptables -w 5 -t nat -D OUTPUT $rule >/dev/null 2>&1; do
+        :
+      done
+    done
+}
+
+sync_android_dns_redirect() {
+  dns_address="$(effective_dns_resolver_address)" || return 0
+  netbird_dns_is_listening || return 0
+  rm -f "$NB_RUN_DIR/dns.domains" >/dev/null 2>&1 || true
+  upstreams="$(dns_upstreams 2>/dev/null || true)"
+  if [ -n "$upstreams" ]; then
+    printf '%s\n' "$upstreams" >"$NB_DNS_UPSTREAMS_FILE" 2>/dev/null || true
+  fi
+  cleanup_android_dns_redirect
+  printf '%s\n' "$dns_address" >"$NB_DNS_REDIRECT_TARGET_FILE" 2>/dev/null || true
+  for proto in udp tcp; do
+    for upstream in $upstreams; do
+      if [ -n "$NB_DAEMON_GID" ] && su_supports_group; then
+        iptables -w 5 -t nat -A OUTPUT -p "$proto" -d "$upstream" --dport 53 -m owner --gid-owner "$NB_DAEMON_GID" -j RETURN >/dev/null 2>&1 || true
+      else
+        iptables -w 5 -t nat -A OUTPUT -p "$proto" -d "$upstream" --dport 53 -m owner --uid-owner 0 -j RETURN >/dev/null 2>&1 || true
+      fi
+    done
+    iptables -w 5 -t nat -A OUTPUT -p "$proto" --dport 53 -j DNAT --to-destination "$dns_address" >/dev/null 2>&1 || true
+  done
+}
+
+cleanup_android_policy_rules() {
+  i=0
+  while :; do
+    rule_priority="$(
+      ip rule show 2>/dev/null |
+        awk -v table="$NB_POLICY_ROUTE_TABLE" '$0 ~ ("lookup[[:space:]]+" table "([[:space:]]|$)") { sub(/:.*/, "", $1); print $1; exit }'
+    )"
+    [ -n "$rule_priority" ] || break
+    ip rule del priority "$rule_priority" >/dev/null 2>&1 || break
+    i=$((i + 1))
+    [ "$i" -gt 64 ] && break
+  done
+  ip route flush table "$NB_POLICY_ROUTE_TABLE" >/dev/null 2>&1 || true
+  ip route flush cache >/dev/null 2>&1 || true
+}
+
+sync_android_policy_rules() {
+  iface="$(wg_iface_name)"
+  ip link show "$iface" >/dev/null 2>&1 || {
+    cleanup_android_policy_rules
+    return 0
+  }
+
+  routes="$(ip -4 route show dev "$iface" 2>/dev/null | awk '$1 ~ /\// { print $1 }' | sort -u)"
+  [ -n "$routes" ] || {
+    cleanup_android_policy_rules
+    return 0
+  }
+
+  cleanup_android_policy_rules
+  for prefix in $routes; do
+    ip route replace "$prefix" dev "$iface" table "$NB_POLICY_ROUTE_TABLE" >/dev/null 2>&1 || true
+    ip rule add priority "$NB_POLICY_RULE_PRIORITY" to "$prefix" lookup "$NB_POLICY_ROUTE_TABLE" >/dev/null 2>&1 || true
+  done
+  ip route flush cache >/dev/null 2>&1 || true
+}
+
+cleanup_android_inbound_wt_rules() {
+  iface="$(wg_iface_name)"
+  while iptables -w 5 -D INPUT -i "$iface" -j ACCEPT >/dev/null 2>&1; do
+    :
+  done
+  while iptables -w 5 -D INPUT -i "$iface" -p icmp -j ACCEPT >/dev/null 2>&1; do
+    :
+  done
+}
+
+sync_android_inbound_wt_rules() {
+  iface="$(wg_iface_name)"
+  ip link show "$iface" >/dev/null 2>&1 || {
+    cleanup_android_inbound_wt_rules
+    return 0
+  }
+
+  cleanup_android_inbound_wt_rules
+  iptables -w 5 -I INPUT 2 -i "$iface" -j ACCEPT >/dev/null 2>&1 || true
+}
+
+refresh_android_policy_rules() {
+  i=0
+  while [ "$i" -lt 6 ]; do
+    sync_android_vpn_bypass_rules
+    sync_android_policy_rules
+    sync_android_inbound_wt_rules
+    sync_android_resolv_conf
+    sync_android_dns_redirect
+    i=$((i + 1))
+    sleep 2
+  done
+}
+
+start_daemon() {
+  mkdir -p "$NB_RUN_DIR"
+  if is_running; then
+    log Info "NetBird daemon is already running with PID: $(daemon_pid)"
+    refresh_android_policy_rules
+    return 0
+  fi
+  command -v netbird >/dev/null 2>&1 || {
+    log Error "netbird binary not found"
+    return 1
+  }
+  prepare_android_resolvconf_manager
+  ensure_native_config
+  sync_android_vpn_bypass_rules
+  [ -f "$NB_LOG_FILE" ] && mv -f "$NB_LOG_FILE" "${NB_LOG_FILE}.bak"
+  rm -f "$NB_DAEMON_SOCKET"
+  log Info "Starting NetBird daemon"
+  start_netbird_process
+  pid="$!"
+  echo "$pid" >"$PID_FILE"
+  sleep 2
+  if ! is_running; then
+    log Error "NetBird daemon exited during startup"
+    return 1
+  fi
+  if wait_ready; then
+    log Success "NetBird daemon is ready with PID: $(daemon_pid)"
+  else
+    log Warning "NetBird daemon is running but did not answer readiness check"
+  fi
+  refresh_android_policy_rules
+}
+
+stop_daemon() {
+  cleanup_android_vpn_bypass_rules
+  cleanup_android_policy_rules
+  cleanup_android_inbound_wt_rules
+  cleanup_android_dns_redirect
+  restore_android_resolv_conf
+  if ! is_running; then
+    log Info "NetBird daemon is not running"
+    rm -f "$PID_FILE" "$NB_DAEMON_SOCKET"
+    return 0
+  fi
+  log Info "Stopping NetBird daemon with PID: $(daemon_pid)"
+  kill_command "$DAEMON_PATTERN" 15
+  sleep 3
+  if is_running; then
+    log Warning "NetBird daemon did not stop; forcing shutdown"
+    kill_command "$DAEMON_PATTERN" 9
+    sleep 1
+  fi
+  if is_running; then
+    log Error "NetBird daemon is still running with PID: $(daemon_pid)"
+    return 1
+  fi
+  rm -f "$PID_FILE" "$NB_DAEMON_SOCKET"
+  log Success "NetBird daemon stopped"
+}
+
+status_daemon() {
+  if is_running; then
+    echo "Daemon: running ($(daemon_pid))"
+    netbird status 2>/dev/null || true
+    echo
+    echo "Android policy rules:"
+    ip rule show 2>/dev/null | grep "lookup ${NB_POLICY_ROUTE_TABLE}" || true
+    echo
+    echo "Android VPN bypass mark:"
+    [ -n "$NB_DAEMON_GID" ] && printf 'gid %s -> mark %s\n' "$NB_DAEMON_GID" "$NB_ANDROID_VPN_PROTECT_MARK" || true
+    iptables -t mangle -S OUTPUT 2>/dev/null | grep -- "--gid-owner ${NB_DAEMON_GID}" || true
+    ip rule show 2>/dev/null | grep "^${NB_ROOT_BYPASS_RULE_PRIORITY}:" || true
+    ip -6 rule show 2>/dev/null | grep "^${NB_ROOT_BYPASS_RULE_PRIORITY}:" || true
+    echo
+    echo "Android NetBird route table (${NB_POLICY_ROUTE_TABLE}):"
+    ip route show table "$NB_POLICY_ROUTE_TABLE" 2>/dev/null || true
+    echo
+    echo "Android inbound NetBird interface compatibility:"
+    iptables -L INPUT -nv --line-numbers 2>/dev/null | grep "ACCEPT.*$(wg_iface_name)" || true
+    echo
+    echo "Android DNS redirect:"
+    dns_address="$(effective_dns_resolver_address 2>/dev/null || true)"
+    [ -n "$dns_address" ] && echo "$dns_address"
+    iptables -t nat -S OUTPUT 2>/dev/null | grep -E -- "dport 53|--to-destination ${dns_address}" || true
+    echo
+    echo "Android resolv.conf:"
+    sed -n '1,8p' "$NB_RESOLV_CONF" 2>/dev/null || true
+  else
+    echo "Daemon: stopped"
+  fi
+}
+
+show_log() {
+  case "${1:-}" in
+    daemon)
+      busybox tail -n +1 -F "$NB_LOG_FILE"
+      ;;
+    service)
+      busybox tail -n +1 -F "$NB_RUN_LOG_FILE"
+      ;;
+    *)
+      usage
+      return 1
+      ;;
+  esac
+}
+
+case "${1:-}" in
+  start)
+    start_daemon
+    ;;
+  stop)
+    stop_daemon
+    ;;
+  restart)
+    stop_daemon
+    sleep 1
+    start_daemon
+    ;;
+  status)
+    status_daemon
+    ;;
+  log)
+    show_log "${2:-}"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  sync-policy)
+    refresh_android_policy_rules
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

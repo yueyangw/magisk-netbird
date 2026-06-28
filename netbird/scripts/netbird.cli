@@ -1,0 +1,134 @@
+#!/system/bin/sh
+
+DIR="$(dirname "$(realpath "$0")")"
+. "$DIR/../settings.sh"
+
+export NB_DAEMON_ADDR
+export NB_STATE_DIR
+export NB_LOG_FILE
+
+NETBIRD_BIN="/data/adb/netbird/bin/netbird"
+
+ensure_native_config() {
+  [ -s "$NB_CONFIG_FILE" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  tmp="${NB_CONFIG_FILE}.tmp.$$"
+  if dns_resolver_address_is_custom; then
+    filter='.DisableIPv6 = true | .DisableIPv6Discovery = true | .DisableDNS = false | .CustomDNSAddress = $dns'
+  else
+    filter='.DisableIPv6 = true | .DisableIPv6Discovery = true | .DisableDNS = false | del(.CustomDNSAddress)'
+  fi
+  if jq --arg dns "$NB_DNS_RESOLVER_ADDRESS" "$filter" "$NB_CONFIG_FILE" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$NB_CONFIG_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+append_admin_url_if_missing() {
+  cmd_name="$1"
+  shift || true
+
+  management_url=""
+  has_admin_url=0
+  previous_arg=""
+
+  for arg in "$@"; do
+    if [ "$previous_arg" = "--management-url" ] || [ "$previous_arg" = "-m" ]; then
+      management_url="$arg"
+    fi
+
+    case "$arg" in
+      --admin-url|--admin-url=*)
+        has_admin_url=1
+        ;;
+      --management-url=*)
+        management_url="${arg#--management-url=}"
+        ;;
+      -m=*)
+        management_url="${arg#-m=}"
+        ;;
+    esac
+
+    previous_arg="$arg"
+  done
+
+  if [ "$has_admin_url" -eq 0 ] && [ -n "$management_url" ]; then
+    "$NETBIRD_BIN" "$cmd_name" "$@" --admin-url "$management_url"
+  else
+    "$NETBIRD_BIN" "$cmd_name" "$@"
+  fi
+}
+
+append_android_default_flags() {
+  cmd_name="$1"
+  shift || true
+
+  has_disable_ipv6=0
+  has_disable_dns=0
+  has_dns_resolver_address=0
+  previous_arg=""
+  for arg in "$@"; do
+    if [ "$previous_arg" = "--dns-resolver-address" ]; then
+      has_dns_resolver_address=1
+    fi
+
+    case "$arg" in
+      --disable-ipv6|--disable-ipv6=*)
+        has_disable_ipv6=1
+        ;;
+      --disable-dns|--disable-dns=*)
+        has_disable_dns=1
+        ;;
+      --dns-resolver-address|--dns-resolver-address=*)
+        has_dns_resolver_address=1
+        ;;
+    esac
+
+    previous_arg="$arg"
+  done
+
+  if [ "$has_disable_ipv6" -eq 0 ]; then
+    set -- "$@" --disable-ipv6
+  fi
+
+  if [ "$cmd_name" = "up" ]; then
+    if [ "$has_disable_dns" -eq 0 ]; then
+      set -- "$@" --disable-dns=false
+    fi
+    if [ "$has_dns_resolver_address" -eq 0 ] && dns_resolver_address_is_custom; then
+      set -- "$@" --dns-resolver-address "$NB_DNS_RESOLVER_ADDRESS"
+    fi
+  fi
+
+  append_admin_url_if_missing "$cmd_name" "$@"
+}
+
+run_netbird() {
+  case "${1:-}" in
+    up)
+      cmd_name="$1"
+      shift || true
+      append_android_default_flags "$cmd_name" "$@"
+      rc="$?"
+      ensure_native_config
+      netbird.service sync-policy >/dev/null 2>&1 || true
+      return "$rc"
+      ;;
+    login)
+      cmd_name="$1"
+      shift || true
+      append_admin_url_if_missing "$cmd_name" "$@"
+      rc="$?"
+      ensure_native_config
+      netbird.service sync-policy >/dev/null 2>&1 || true
+      return "$rc"
+      ;;
+    *)
+      "$NETBIRD_BIN" "$@"
+      ;;
+  esac
+}
+
+run_netbird "$@"

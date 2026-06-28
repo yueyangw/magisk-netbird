@@ -1,0 +1,65 @@
+#!/system/bin/sh
+# Magisk NetBird resolvconf stub.
+#
+# NetBird's Linux DNS manager can use resolvconf without writing backups under
+# Android's read-only /etc. This stub accepts the operations NetBird needs and
+# records the requested config for diagnostics.
+
+DIR="$(dirname "$(realpath "$0")")"
+. "$DIR/../settings.sh"
+
+usage() {
+  echo "usage: resolvconf [--version|-a IFACE|-d IFACE|-f -d IFACE|-x -a IFACE]"
+}
+
+iface=""
+action=""
+
+case "${1:-}" in
+  --version)
+    echo "resolvconf (Magisk NetBird resolvconf stub)"
+    exit 0
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -a)
+      action="add"
+      shift
+      iface="${1:-}"
+      ;;
+    -d)
+      action="delete"
+      shift
+      iface="${1:-}"
+      ;;
+    -f|-x)
+      ;;
+    *)
+      ;;
+  esac
+  shift || break
+done
+
+mkdir -p "$NB_RUN_DIR/resolvconf" >/dev/null 2>&1 || true
+
+case "$action" in
+  add)
+    [ -n "$iface" ] || exit 0
+    cat >"$NB_RUN_DIR/resolvconf/${iface}.conf" 2>/dev/null || true
+    ;;
+  delete)
+    [ -n "$iface" ] || exit 0
+    rm -f "$NB_RUN_DIR/resolvconf/${iface}.conf" >/dev/null 2>&1 || true
+    ;;
+  *)
+    cat >/dev/null 2>&1 || true
+    ;;
+esac
+
+exit 0
