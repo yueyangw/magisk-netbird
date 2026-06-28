@@ -1,6 +1,6 @@
 id=magisk-netbird
 name=Magisk NetBird
-version=v0.1.13
-versionCode=00010013
+version=v0.1.0
+versionCode=00010000
 author=Codex
 description=NetBird client for rooted Android with native WireGuard interface management.
